@@ -1,0 +1,11 @@
+out
+dist
+node_modules
+.vscode-test/
+*.vsix
+
+
+# Added by cargo
+
+/target
+/Cargo.lock
