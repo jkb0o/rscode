@@ -246,11 +246,17 @@ impl<T: ObjKeys> Obj<T> {
     pub fn b() -> ObjBuilder<T, T::Required> {
         ObjBuilder::new()
     }
+    pub fn builder() -> ObjBuilder<T, T::Required> {
+        ObjBuilder::new()
+    }
     pub fn empty() -> Self {
         Obj {
             data: HashMap::new(),
             marker: PhantomData
         }
+    }
+    pub fn to_js_value(&self) -> JsValue {
+        JsValue::UNDEFINED
     }
 }
 
@@ -376,6 +382,90 @@ pub fn validator<R, T: ObjKeys>(builder: &ObjBuilder<T, R>) -> Undefined<R> {
     builder.missing.into()
 }
 
+macro_rules! parse {
+    ($obj:expr;) => {
+        {
+            // let obj = $obj;
+            // validator(&obj).build(|| obj.build())
+            $obj.build()
+        }
+    };
+    ($obj:expr; $field:ident) => {
+        parse!($obj.$field(InvalidValue);)
+    };
+    ($obj:expr; $field:ident: $value:expr) => {
+        parse!($obj.$field($value);)
+    };
+    ($obj:expr; $field:ident) => {
+        parse!($obj.$field(InvalidValue);)
+    };
+    ($obj:expr; $field:ident: $value:expr, $($rest:tt)*) => {
+        parse!($obj.$field($value); $($rest)*)
+    };
+    // ($obj:expr; $field:ident: $value:expr, $($rest:tt)*) => {
+    //     parse!($obj.$field($value); $($rest)*)
+    // };
+}
+
+macro_rules! new {
+    // ($ty:ty { $($rest:tt)* }) => {
+    //     parse!(Obj::<$ty>::builder().defined(); $($rest)* )
+    // };
+    
+    ($ty:ty { 
+        $f0:ident
+    }) => {
+        Obj::<$ty>::builder().defined().$f0(InvalidValue).build()
+    };
+    ($ty:ty { 
+        $f0:ident: $v0:expr $(,)?
+    }) => {
+        Obj::<$ty>::builder().defined().$f0($v0).build()
+    };
+    ($ty:ty { 
+        $f0:ident: $v0:expr,
+        $f1:ident
+    }) => {
+        Obj::<$ty>::builder().defined()
+            .$f0($v0)
+            .$f1(InvalidValue)
+            .build()
+    };
+    ($ty:ty { 
+        $f0:ident: $v0:expr,
+        $f1:ident: $v1:expr $(,)?
+    }) => {
+        Obj::<$ty>::builder().defined()
+            .$f0($v0)
+            .$f1($v1)
+            .build()
+    };
+    ($ty:ty { 
+        $f0:ident: $v0:expr,
+        $f1:ident: $v1:expr,
+        $f2:ident
+    }) => {
+        Obj::<$ty>::builder().defined()
+            .$f0($v0)
+            .$f1($v1)
+            .$f2(InvalidValue)
+            .build()
+    };
+    ($ty:ty { 
+        $f0:ident: $v0:expr,
+        $f1:ident: $v1:expr,
+        $f2:ident: $v2:expr $(,)?
+    }) => {
+        Obj::<$ty>::builder().defined()
+            .$f0($v0)
+            .$f1($v1)
+            .$f2($v2)
+            .build()
+    };
+    
+    
+}
+
 
 macro_rules! obj {
     
@@ -426,6 +516,41 @@ macro_rules! obj {
 
 }
 
+// type Builder<T> = dyn Fn(ObjBuilder<T, <T as ObjKeys>::Required>);
+// pub trait Interface<T: ObjKeys>: Fn(ObjBuilder<T, <T as ObjKeys>::Required>) -> Obj<T> { }
+// impl<F: Fn(ObjBuilder<T, <T as ObjKeys>::Required>), T: ObjKeys> Interface<T> for F { }
+pub trait Interface<T: ObjKeys> { 
+    fn implement(&self) -> JsValue;
+}
+// pub struct Implementation<T: ObjKeys, F: Fn(ObjBuilder<T, <T as ObjKeys>::Required>) -> Obj<T>>(F, PhantomData<T>);
+pub struct Implementation<T>(T);
+impl<F: Fn(ObjBuilder<T, <T as ObjKeys>::Required>) -> Obj<T>, T: ObjKeys> Interface<T> for Implementation<F> {
+    fn implement(&self) -> JsValue {
+        (self.0)(ObjBuilder::new()).to_js_value()
+    }
+}
+
+pub trait ITerminalOptions {
+    fn name(&self) -> String;
+    fn shell_path(&self) -> String;
+}
+
+impl<I: ITerminalOptions> Interface<TerminalOptions> for I {
+    fn implement(&self) -> JsValue {
+        JsValue::UNDEFINED
+    }
+}
+
+pub struct DefaultTerminalOptions;
+impl ITerminalOptions for DefaultTerminalOptions {
+    fn name(&self) -> String {
+        format!("")
+    }
+    fn shell_path(&self) -> String {
+        format!("")
+    }
+}
+
 fn test_obj() {
     // let builder: ObjBuilder<_, TerminalOptions> = ObjBuilder::new();
     // let b = builder.name("hello");
@@ -454,10 +579,20 @@ fn test_obj() {
         shell_path: "hello",
         name: "hello"
     });
+    fn ao(options: impl Interface<TerminalOptions>) {
+        let otps = options.implement();
+        
+    }
+    ao(Implementation(|builder: ObjBuilder<_, _>| {
+        builder.build()
+    }));
+    ao(DefaultTerminalOptions);
+    
     
 
     let _x = format(obj! {
-        ident: "hello!"
+        ident: "hello!",
+
         // ident: 23
     });
 
@@ -472,6 +607,11 @@ fn test_obj() {
     let u = takes_union(obj! {
         ident: "hello"
     });
+    // Obj::<TerminalOptions>::builder().defined().
+    new!(TerminalOptions {
+        shell_path: "",
+        name: ""
+    });
     let x = takes_union::<String, _>(obj! {
         name: "hello"
     });
@@ -481,6 +621,10 @@ fn test_obj() {
         name: "world"
     });
     let x = takes_union2("opts".to_string());
+
+    takes_formatting_options_impl(obj! {
+        ident: 23
+    });
     // let x = takes_union2("opts");
 }
 pub enum Void { }
@@ -504,6 +648,12 @@ fn takes_union2<T: InUnion<(String, Obj<TerminalOptions>)>>(opts: T) -> T {
     opts
 }
 
+
+pub trait IFormattingOptions { }
+impl<T: Into<JsValue>> IFormattingOptions for Obj<FormatingOptions<T>> { }
+fn takes_formatting_options_impl(options: impl IFormattingOptions) { 
+
+}
 
 
 

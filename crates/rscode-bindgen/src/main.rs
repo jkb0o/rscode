@@ -6,7 +6,7 @@ use swc_common::{
     sync::Lrc,
     FileName, SourceMap,
 };
-use swc_ecma_ast::{Stmt, Decl, ModuleItem, TsNamespaceBody, TsModuleName, ModuleDecl, TsModuleDecl, TsInterfaceDecl, TsTypeElement, TsType, TsKeywordType, TsKeywordTypeKind, TsPropertySignature, Module, ClassMember, TsEntityName, TsTypeOperator, TsTypeOperatorOp, TsUnionOrIntersectionType, TsUnionType, TsFnParam, TsTypeLit, Pat, PropName, Expr, VarDecl, VarDeclarator, TsEnumMemberId, Lit, UnaryOp, ParamOrTsParamProp, TsParamProp, TsParamPropParam, TsTypeParamDecl, TsLit};
+use swc_ecma_ast::{Stmt, Decl, ModuleItem, TsNamespaceBody, TsModuleName, ModuleDecl, TsModuleDecl, TsInterfaceDecl, TsTypeElement, TsType, TsKeywordType, TsKeywordTypeKind, TsPropertySignature, Module, ClassMember, TsEntityName, TsTypeOperator, TsTypeOperatorOp, TsUnionOrIntersectionType, TsUnionType, TsFnParam, TsTypeLit, Pat, PropName, Expr, VarDecl, VarDeclarator, TsEnumMemberId, Lit, UnaryOp, ParamOrTsParamProp, TsParamProp, TsParamPropParam, TsTypeParamDecl, TsLit, TsFnOrConstructorType};
 use swc_ecma_parser::{lexer::Lexer, Capturing, Parser, StringInput, Syntax, TsConfig};
 
 fn main() {
@@ -56,7 +56,7 @@ fn main() {
                 return None;
             }
             Some(Type::Future(Box::new(
-                api.resolve_type(&reftype.type_params.as_ref().unwrap().params.get(0).unwrap() , false)
+                api.resolve_type(&reftype.type_params.as_ref().unwrap().params.get(0).unwrap())
             )))
         })
     ]);
@@ -205,16 +205,16 @@ pub enum Type {
     None,
     Primitive(&'static str),
     Array(Box<Type>),
+    ReadOnly(Box<Type>),
     ObjectMap(Box<Type>, Box<Type>),
     Optional(Box<Type>),
-    Ref(Box<Type>),
-    Mut(Box<Type>),
     Reference(String, Vec<Type>),
     Path(Vec<String>),
     Union(Vec<Type>),
     Tuple(Vec<Type>),
     Object(Vec<(String, Type)>),
     Future(Box<Type>),
+    Function(Box<Function>),
 }
 
 impl std::fmt::Display for Type {
@@ -222,11 +222,10 @@ impl std::fmt::Display for Type {
         match self {
             Self::None => write!(f, "Void"),
             Self::Primitive(p) => write!(f, "{p}"),
+            Self::ReadOnly(p) => write!(f, "ReadOnly<{p}>"),
             Self::Array(a) => write!(f, "Array<{}>", a.as_ref()),
             Self::ObjectMap(k, v) => write!(f, "ObjMap<{}, {}>", k.as_ref(), v.as_ref()),
             Self::Optional(t) => write!(f, "Option<{}>", t.as_ref()),
-            Self::Ref(t) => write!(f, "Ref<{}>", t.as_ref()),
-            Self::Mut(t) => write!(f, "Mut<{}>", t.as_ref()),
             Self::Reference(r, p) => {
                 let params = if p.is_empty() { "".to_string() } else {
                     format!("<{}>", p.iter().map(|t| format!("{t}")).collect::<Vec<_>>().join(", "))
@@ -237,6 +236,11 @@ impl std::fmt::Display for Type {
             Self::Union(u) => write!(f, "Union<({})>", u.iter().map(|t| format!("{t}")).collect::<Vec<_>>().join(", ")),
             Self::Tuple(t) => write!(f, "({})", t.iter().map(|t| format!("{t}")).collect::<Vec<_>>().join(", ")),
             Self::Future(t) => write!(f, "Future<{t}>"),
+            Self::Function(func) => {
+                let args = func.args.iter().map(|a| format!("{}: {}", a.name, a.typ)).collect::<Vec<_>>().join(", ");
+                let rtype = &func.return_type;
+                write!(f, "fn({args}) -> {rtype}")
+            },
             Self::Object(fields) => {
                 let repr = fields.iter().map(|(n, t)| format!("{n}<{t}>")).collect::<Vec<_>>().join(", ");
                 write!(f, "Obj<({repr})>")
@@ -250,8 +254,6 @@ impl Type {
     fn internal(&self) -> String {
         match self {
             Self::Primitive(r) => r.to_string(),
-            Self::Ref(r) => r.internal(),
-            Self::Mut(r) => r.internal(),
             Self::Array(_) => "js_sys::Array".into(),
             Self::Optional(r) => format!("Option<{}>", r.internal()),
             t => panic!("{t:?} has not internal representation"),
@@ -261,8 +263,6 @@ impl Type {
         match self {
             Self::Primitive(r) => r.to_string(),
             Self::Array(r) => format!("Array<{}>", r.public()),
-            Self::Ref(r) => format!("Ref<{}>", r.public()),
-            Self::Mut(r) => format!("Mut<{}>", r.public()),
             Self::Optional(r) => if r.is_array() {
                 r.public()
             } else {
@@ -276,8 +276,6 @@ impl Type {
     pub fn is_array(&self) -> bool {
         match self {
             Self::Array(_) => true,
-            Self::Ref(r) => r.is_array(),
-            Self::Mut(r) => r.is_array(),
             _ => false
         }
     }
@@ -296,8 +294,6 @@ impl Type {
     pub fn impl_getter(&self, prop: &str) -> String {
         match self {
             Self::Primitive(_) => format!("{prop}"),
-            Self::Mut(r) => format!("Mut::associate(self, {})", r.impl_getter(prop)),
-            Self::Ref(r) => format!("Ref::associate(self, {})", r.impl_getter(prop)),
             Self::Array(_) => format!("{prop}.into()"),
             Self::Optional(r) if r.is_array() => format!(
                 "if let Some(prop) = {prop} {{ {} }} else {{ {} }}",
@@ -312,9 +308,8 @@ impl Type {
     pub fn populate_references(&self, refs: &mut HashSet<String>) {
         match self {
             Self::Array(t) => { t.populate_references(refs); },
-            Self::Mut(t)  => { t.populate_references(refs); },
-            Self::Ref(t) => { t.populate_references(refs); },
             Self::None => { },
+            Self::ReadOnly(t) => { t.populate_references(refs); },
             Self::ObjectMap(k, v) => {
                 k.populate_references(refs);
                 v.populate_references(refs);
@@ -330,14 +325,17 @@ impl Type {
             Self::Union(t) => t.iter().for_each(|t| t.populate_references(refs)),
             Self::Object(f) => f.iter().for_each(|(_, t)| t.populate_references(refs)),
             Self::Future(t) => t.populate_references(refs),
+            Self::Function(f) => {
+                f.return_type.populate_references(refs);
+                f.args.iter().for_each(|a| a.typ.populate_references(refs));
+            }
         };
     }
     pub fn map(&self, pmap: &HashMap<String, Type>) -> Type {
         match self {
             Self::Array(t) => Self::Array(Box::new(t.map(pmap))),
-            Self::Mut(t) => Self::Mut(Box::new(t.map(pmap))),
-            Self::Ref(t) => Self::Ref(Box::new(t.map(pmap))),
             Self::None => Self::None,
+            Self::ReadOnly(t) => Self::ReadOnly(Box::new(t.map(pmap))),
             Self::ObjectMap(k, v) => Self::ObjectMap(Box::new(k.map(pmap)), Box::new(v.map(pmap))),
             Self::Optional(t) => Self::Optional(Box::new(t.map(pmap))),
             // TODO: do something with fkn path
@@ -347,6 +345,21 @@ impl Type {
             Self::Union(t) => Self::Union(t.iter().map(|t| t.map(pmap)).collect()),
             Self::Object(t) => Self::Object(t.iter().map(|(n, t)| (n.clone(), t.map(pmap))).collect()),
             Self::Future(t) => t.map(pmap),
+            Self::Function(f) => {
+                Self::Function(Box::new(Function {
+                    name: f.name.clone(),
+                    return_type: f.return_type.map(pmap),
+                    args: f.args.iter().map(|a| {
+                        Argument {
+                            name: a.name.clone(),
+                            optional: a.optional,
+                            varargs: a.varargs,
+                            typ: a.typ.map(pmap)
+                        }
+                    })
+                    .collect()
+                }))
+            },
             Self::Reference(name, params) => {
                 if pmap.contains_key(name) && params.is_empty() {
                     pmap.get(name).unwrap().clone()
@@ -365,6 +378,7 @@ impl Type {
     }
 }
 
+#[derive(Debug)]
 pub struct Property {
     name: String,
     typ: Type,
@@ -372,19 +386,23 @@ pub struct Property {
     optional: bool
 }
 
+#[derive(Debug)]
 pub struct Constructor {
     args: Vec<Argument>
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Function {
     name: String,
     return_type: Type,
     args: Vec<Argument>
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Argument {
     name: String,
     typ: Type,
+    optional: bool,
     varargs: bool,
 }
 
@@ -393,19 +411,17 @@ impl Argument {
         match param {
             Pat::Ident(ident) => {
                 let name = ident.id.sym.to_string();
-                let mut typ = typedb.resolve_type(&ident.type_ann.as_ref().unwrap().type_ann, false);
-                if ident.optional {
-                    typ = typ.to_optional()
-                }
-                Self { name, typ, varargs: false }
+                let mut typ = typedb.resolve_type(&ident.type_ann.as_ref().unwrap().type_ann);
+                let optional = ident.optional;
+                Self { name, typ, optional, varargs: false }
             },
             Pat::Rest(rest) => {
                 let Pat::Ident(ident)  = rest.arg.as_ref() else {
                     panic!("Only ident rest params supported, got: {param:#?}")
                 };
                 let name = ident.sym.to_string();
-                let typ = typedb.resolve_type(&rest.type_ann.as_ref().unwrap().type_ann, false);
-                Self { name, typ, varargs: true }
+                let typ = typedb.resolve_type(&rest.type_ann.as_ref().unwrap().type_ann);
+                Self { name, typ, optional: true, varargs: true }
             },
             _ => panic!("Don't know how to process fnparam {param:#?}")
         }
@@ -414,11 +430,9 @@ impl Argument {
         match &param.param {
             TsParamPropParam::Ident(ident) => {
                 let name = ident.sym.to_string();
-                let mut typ = api.resolve_type(&ident.type_ann.as_ref().unwrap().type_ann, false);
-                if ident.optional {
-                    typ = typ.to_optional();
-                }
-                Argument { name, typ, varargs: false }
+                let mut typ = api.resolve_type(&ident.type_ann.as_ref().unwrap().type_ann);
+                let optional = ident.optional;
+                Argument { name, typ, optional, varargs: false }
             },
             TsParamPropParam::Assign(assign) => {
                 panic!("TsParamPropParam::Assign not yet supported: {assign:#?}");
@@ -430,25 +444,24 @@ impl Argument {
         match param {
             TsFnParam::Ident(ident) => {
                 let name = ident.sym.to_string();
-                let mut typ = typedb.resolve_type(ident.type_ann.as_ref().unwrap().type_ann.as_ref(), false);
-                if ident.optional {
-                    typ = typ.to_optional();
-                }
-                Self { name, typ, varargs: false }
+                let mut typ = typedb.resolve_type(ident.type_ann.as_ref().unwrap().type_ann.as_ref());
+                let optional = ident.optional;
+                Self { name, typ, optional, varargs: false }
             },
             TsFnParam::Rest(rest) => {
                 let Pat::Ident(ident)  = rest.arg.as_ref() else {
                     panic!("Only ident rest params supported, got: {param:#?}")
                 };
                 let name = ident.sym.to_string();
-                let typ = typedb.resolve_type(&rest.type_ann.as_ref().unwrap().type_ann, false);
-                Self { name, typ, varargs: true }
+                let typ = typedb.resolve_type(&rest.type_ann.as_ref().unwrap().type_ann);
+                Self { name, typ, optional: true, varargs: true }
             }
             _ => panic!("Don't know how to process fnparam {param:#?}")
         }
     }
 }
 
+#[derive(Debug)]
 pub enum Member {
     Property(Property),
     Method(Function),
@@ -473,19 +486,19 @@ impl Member {
                 let name = prop.key.as_ident().unwrap().sym.to_string();
                 let readonly = prop.readonly;
                 let optional = prop.optional;
-                let typ = typedb.resolve_type(prop.type_ann.as_ref().unwrap().type_ann.as_ref(), false);
+                let typ = typedb.resolve_type(prop.type_ann.as_ref().unwrap().type_ann.as_ref());
                 Member::Property(Property { name, typ, readonly, optional })
             },
             TsTypeElement::TsMethodSignature(method) => {
                 let name = method.key.as_ident().unwrap().sym.to_string();
                 let args = method.params.iter().map(|p| Argument::from_ts_fn_param(typedb, p)).collect();
-                let return_type = typedb.resolve_type(method.type_ann.as_ref().unwrap().type_ann.as_ref(), false);
+                let return_type = typedb.resolve_type(method.type_ann.as_ref().unwrap().type_ann.as_ref());
                 Member::Method(Function { name, args, return_type })
             },
             TsTypeElement::TsCallSignatureDecl(sig) => {
                 let name = "".into();
                 let args = sig.params.iter().map(|p| Argument::from_ts_fn_param(typedb, p)).collect();
-                let return_type = typedb.resolve_type(&sig.type_ann.as_ref().unwrap().type_ann, false);
+                let return_type = typedb.resolve_type(&sig.type_ann.as_ref().unwrap().type_ann);
                 Member::Call(Function { name, args, return_type })
             },
             TsTypeElement::TsIndexSignature(sig) => {
@@ -496,8 +509,8 @@ impl Member {
                 let TsFnParam::Ident(key) = key else {
                     panic!("Unsupported index signature {sig:#?}");
                 };
-                let key = typedb.resolve_type(&key.type_ann.as_ref().unwrap().type_ann, false);
-                let value = typedb.resolve_type(&sig.type_ann.as_ref().unwrap().type_ann, false);
+                let key = typedb.resolve_type(&key.type_ann.as_ref().unwrap().type_ann);
+                let value = typedb.resolve_type(&sig.type_ann.as_ref().unwrap().type_ann);
                 Member::Index(key, value)
             }
             _ => panic!("Unsupported interface member {member:#?}")
@@ -511,7 +524,7 @@ impl Member {
                 let name = prop.key.as_ident().unwrap().sym.to_string();
                 let readonly = prop.readonly;
                 let optional = prop.is_optional;
-                let typ = typedb.resolve_type(prop.type_ann.as_ref().unwrap().type_ann.as_ref(), false);
+                let typ = typedb.resolve_type(prop.type_ann.as_ref().unwrap().type_ann.as_ref());
                 Member::Property(Property { name, typ, readonly, optional })
             },
             ClassMember::Method(method) => {
@@ -526,7 +539,7 @@ impl Member {
                 // if let PropName::
                 let name = method.key.as_ident().expect(format!("{member:#?}").as_str()).sym.to_string();
                 let args = method.function.params.iter().map(|p| Argument::from_pat(typedb, &p.pat)).collect();
-                let return_type = typedb.resolve_type(&method.function.return_type.as_ref().unwrap().type_ann, false);
+                let return_type = typedb.resolve_type(&method.function.return_type.as_ref().unwrap().type_ann);
                 Member::Method(Function {name, args, return_type})
             },
             ClassMember::Constructor(constructor) => {
@@ -542,10 +555,12 @@ impl Member {
 }
 
 
+#[derive(Debug, PartialEq)]
 pub enum StructKind {
     Interface,
     Class,
 }
+#[derive(Debug)]
 pub struct Struct {
     name: String,
     members: Vec<Member>,
@@ -571,21 +586,25 @@ impl Struct {
     }
 }
 
+#[derive(Debug)]
 pub struct Alias {
     name: String,
     typ: Type,
 }
 
+#[derive(Debug)]
 pub struct Var {
     name: String,
     typ: Type
 }
 
+#[derive(Debug)]
 pub struct Enum {
     name: String,
     members: Vec<(String, i32)>
 }
 
+#[derive(Debug)]
 pub enum ApiMember {
     Struct(Struct),
     Function(Function),
@@ -596,6 +615,16 @@ pub enum ApiMember {
 }
 
 impl ApiMember {
+    pub fn name(&self) -> &String {
+        match self {
+            Self::Struct(s) => &s.name,
+            Self::Function(f) => &f.name,
+            Self::Functions(f) => &f[0].name,
+            Self::Alias(a) => &a.name,
+            Self::Var(v) => &v.name,
+            Self::Enum(e) => &e.name,
+        }
+    }
     pub fn add_output_type(&self, api: &Api, output: &mut HashSet<Type>, params: &Vec<Type>, mut pmap: HashMap<String, Type>) {
         match self {
             ApiMember::Enum(_) => { /* TODO: should I ignore enum content? */}
@@ -671,10 +700,44 @@ impl TypeMapImpl for HashMap<String, Type> {
 
 pub type TypeResolver = Box<dyn Fn(&Api, &TsType) -> Option<Type>>;
 
+#[derive(PartialEq, Eq, Hash, Clone)]
+pub struct ModuleName(Vec<String>);
+
+impl ModuleName {
+    pub fn new() -> Self {
+        Self(vec![])
+    }
+    pub fn to_js_name(&self) -> String {
+        self.0.join(".")
+    }
+    pub fn to_rs_name(&self) -> String {
+        self.0.join("::")
+    }
+}
+
+impl std::ops::Deref for ModuleName {
+    type Target = Vec<String>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ModuleName {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl std::fmt::Display for ModuleName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_rs_name())
+    }
+}
+
 pub struct Api { 
     members: HashMap<String, ApiMember>,
-    parsing_module: Vec<String>,
-    module_map: HashMap<String, String>,
+    parsing_module: ModuleName,
+    module_map: HashMap<String, ModuleName>,
     resolvers: Vec<TypeResolver>,
 }
 
@@ -694,7 +757,7 @@ impl Api {
     pub fn new<const R: usize>(source: &str, module: &Module, resolvers: [TypeResolver; R]) -> Self {
         let mut typedb = Api {
             members: HashMap::new(),
-            parsing_module: vec![],
+            parsing_module: ModuleName::new(),
             module_map: HashMap::new(),
             resolvers: resolvers.into(),
         };
@@ -711,14 +774,14 @@ impl Api {
         if self.contains_key(&key) {
             panic!("Member {key} already added");
         }
-        let ns = self.parsing_module.join("::");
+        let ns = &self.parsing_module;
         if let Some(declared_ns) = self.module_map.get(&key) {
-            if declared_ns != &ns {
+            if declared_ns != ns {
                 println!("Member {ns}::{key} already declared in module {declared_ns}");
                 return
             }
         }
-        self.module_map.insert(key.clone(), ns);
+        self.module_map.insert(key.clone(), ns.clone());
         self.members.insert(key, value);
     }
 
@@ -810,7 +873,7 @@ impl Api {
                         Decl::Fn(func) => {
                             let name = func.ident.sym.to_string();
                             let args = func.function.params.iter().map(|p| Argument::from_pat(self, &p.pat)).collect();
-                            let return_type = self.resolve_type(&func.function.return_type.as_ref().unwrap().type_ann, false);
+                            let return_type = self.resolve_type(&func.function.return_type.as_ref().unwrap().type_ann);
                             let func = Function { name, args, return_type };
                             println!("Adding function {}", func.name);
                             self.add_function(func);
@@ -850,7 +913,7 @@ impl Api {
                         },
                         Decl::TsTypeAlias(alias) => {
                             let name = alias.id.sym.to_string();
-                            let typ = self.resolve_type(&alias.type_ann.as_ref(), false);
+                            let typ = self.resolve_type(&alias.type_ann.as_ref());
                             self.add_alias(Alias { name, typ })
 
                         },
@@ -860,7 +923,7 @@ impl Api {
                                     panic!("Unsupported var declaration: {decl:#?}")
                                 };
                                 let name = ident.id.sym.to_string();
-                                let typ = self.resolve_type(&ident.type_ann.as_ref().unwrap().type_ann, false);
+                                let typ = self.resolve_type(&ident.type_ann.as_ref().unwrap().type_ann);
                                 self.add_var(Var { name, typ }) 
                             }
                         },
@@ -884,7 +947,7 @@ impl Api {
         //         }
     }
 
-    fn resolve_type(&self, typ: &TsType, readonly: bool) -> Type {
+    fn resolve_type(&self, typ: &TsType) -> Type {
         if let Some(typ) = self.resolvers.iter().find_map(|r| r(self, typ)) {
             return typ
         };
@@ -892,14 +955,14 @@ impl Api {
             TsType::TsKeywordType(t) => resolve_keyword_type(t),
             TsType::TsTypeRef(t) => {
                 let params = if let Some(params) = t.type_params.as_ref() {
-                    params.params.iter().map(|t| self.resolve_type(t, false)).collect()
+                    params.params.iter().map(|t| self.resolve_type(t)).collect()
                 } else {
                     vec![]
                 };
                 t.type_name.into_type(self, params)
             },
             TsType::TsTypeOperator(op) => match &op.op {
-                TsTypeOperatorOp::ReadOnly => self.resolve_type(op.type_ann.as_ref(), true),
+                TsTypeOperatorOp::ReadOnly => self.resolve_type(op.type_ann.as_ref()),
                 op => panic!("Unsupported type operator {op:?}")
             },
             TsType::TsUnionOrIntersectionType(u) => match u {
@@ -909,7 +972,7 @@ impl Api {
                     } else {
                         let mut types = vec![];
                         for t in u.types.iter() {
-                            types.push(self.resolve_type(t.as_ref(), false))
+                            types.push(self.resolve_type(t.as_ref()))
                         }
                         Type::Union(types)
                     }
@@ -921,12 +984,8 @@ impl Api {
                 }
             }
             TsType::TsArrayType(t) => {
-                let elem = self.resolve_type(t.elem_type.as_ref(), readonly);
-                if readonly {
-                    Type::Ref(Box::new(Type::Array(Box::new(elem))))
-                } else {
-                    Type::Mut(Box::new(Type::Array(Box::new(elem))))
-                }
+                let elem = self.resolve_type(t.elem_type.as_ref());
+                Type::Array(Box::new(elem))
             },
             TsType::TsTypeLit(t) => {
                 if t.is_object_map() {
@@ -938,16 +997,25 @@ impl Api {
             TsType::TsTupleType(t) => {
                 Type::Tuple(t.elem_types
                     .iter()
-                    .map(|t| self.resolve_type(&t.ty, false))
+                    .map(|t| self.resolve_type(&t.ty))
                     .collect()
                 )
             },
             TsType::TsFnOrConstructorType(t) => {
-                // TODO: think about function members
-                Type::None
+                let TsFnOrConstructorType::TsFnType(f) = t else {
+                    panic!("Expected TsFnOrConstructorType::TsFnType, got {t:#?}")
+                };
+                let args = f.params.iter().map(|p| Argument::from_ts_fn_param(self, p)).collect();
+                let return_type = self.resolve_type(&f.type_ann.as_ref().type_ann);
+                Type::Function(Box::new(Function {
+                    name: format!(""),
+                    args,
+                    return_type
+                }))
+                
             },
             TsType::TsParenthesizedType(t) => {
-                self.resolve_type(&t.type_ann, false)
+                self.resolve_type(&t.type_ann)
             },
             TsType::TsLitType(lit) => {
                 match &lit.lit {
@@ -1014,7 +1082,7 @@ impl Api {
         println!("Funcs:");
         for (key, member) in self.members.iter() {
             let module = self.module_map.get(key).unwrap();
-            if module != "vscode::commands" {
+            if &module.to_rs_name() != "vscode::commands" {
                 continue
             }
             let ApiMember::Function(func) = member else {
@@ -1023,7 +1091,7 @@ impl Api {
             let name = &func.name;
             let args = func.args.iter().map(|a| format!("{}: {}", a.name, a.typ)).collect::<Vec<_>>().join(", ");
             let rt = &func.return_type;
-            println!("  fn {name}({args}) -> {rt};")
+            println!("  fn {name}({args}) -> {rt};");
         }
 
     }
@@ -1033,7 +1101,7 @@ impl Api {
         self.add_output_type(Type::Reference("ExtensionContext".into(), vec![]), &mut output, HashMap::new());
         for (key, member) in self.members.iter() {
             let module = self.module_map.get(key).unwrap();
-            if module != "vscode::commands" {
+            if &module.to_js_name() != "vscode::commands" {
                 continue
             }
             // if mod
@@ -1055,8 +1123,7 @@ impl Api {
         match ty {
             Type::None => { /* ignore */},
             Type::Array(t) => self.add_output_type(t.map(&pmap), output, pmap),
-            Type::Mut(t) => self.add_output_type(t.map(&pmap), output, pmap),
-            Type::Ref(t) => self.add_output_type(t.map(&pmap), output, pmap),
+            Type::ReadOnly(t) => self.add_output_type(t.map(&pmap), output, pmap),
             Type::Optional(t) => self.add_output_type(t.map(&pmap), output, pmap),
             Type::Path(_) => { /* TODO: add path somehow? */},
             Type::Primitive(_) => { /* ignore */},
@@ -1077,11 +1144,154 @@ impl Api {
                 member.add_output_type(self, output, &params, pmap);
             },
             Type::Future(t) => self.add_output_type(t.map(&pmap), output, pmap),
+            Type::Function(f) => self.add_output_type(f.return_type.map(&pmap), output, pmap),
             Type::Object(fields) => {
                 output.insert(this.map(&pmap));
                 fields.iter().for_each(|(_, t)| self.add_output_type(t.map(&pmap), output, pmap.clone()));
             }
         }
+    }
+}
+
+
+pub struct ModuleWriter {
+    module: ModuleName,
+    public: String,
+    internal: String
+}
+
+#[derive(Default)]
+pub struct SourceWriter {
+    source: String,
+    ident: usize
+}
+
+impl SourceWriter {
+    pub fn add(&mut self, s: impl AsRef<str>) {
+        let s = s.as_ref();
+        self.source += format!("{:width$}{s}\n", " ", width=self.ident*4).as_str();
+    }
+    pub fn ident(&mut self, f: impl FnOnce(&mut Self)) {
+        self.ident += 1;
+        f(self);
+        self.ident -= 1;
+    }
+}
+
+pub struct Writer {
+    path: String,
+    modules: HashMap<ModuleName, ModuleWriter>
+}
+
+impl Writer {
+    pub fn write(&mut self, member: &ApiMember, api: &Api) {
+        let name = member.name();
+        if name.is_empty() {
+            panic!("Can't generate code for nameles ApiMember {member:#?}")
+        }
+        let module_name = api.module_map.get(name).unwrap();
+        let module = self.modules.entry(module_name.clone()).or_insert_with(|| {
+            ModuleWriter {
+                module: module_name.clone(),
+                public: String::new(),
+                internal: String::new()
+            }
+        });
+
+        match member {
+            ApiMember::Struct(s) if s.kind == StructKind::Interface => {
+                self.write_interface(s, api)
+            },
+            ApiMember::Struct(s) if s.kind == StructKind::Class => {
+                self.write_class(s, api)
+            },
+            _ => { }
+        }
+    }
+
+    fn write_interface(&mut self, interface: &Struct, api: &Api) {
+        // let mut public = SourceWriter::default();
+        // let mut internal = SourceWriter::default();
+        // internal.add(format!("#["))
+
+
+    }
+
+    fn write_class(&mut self, class: &Struct, api: &Api) {
+        let mut public = SourceWriter::default();
+        let mut internal = SourceWriter::default();
+        let module_name = api.module_map.get(&class.name).unwrap();
+
+        internal.add(format!("#[wasm_bindgen(module = \"{}\")]", module_name.to_js_name()));
+        internal.add("extern \"C\"{");
+        internal.ident(|internal| {
+            internal.add(format!("pub type {};", class.name));
+            for member in class.members.iter() {
+                // match 
+            }
+        });
+        internal.add("}");
+
+
+    }
+}
+
+pub trait StringExt {
+    fn capitalize(&self) -> String;
+    fn to_camel_case(&self) -> String;
+    fn to_snake_case(&self) -> String;
+}
+
+impl<T: AsRef<str>> StringExt for T {
+    fn capitalize(&self) -> String {
+        let mut chars = self.as_ref().split("").map(|s| s.to_string()).collect::<Vec<_>>();
+        if chars.is_empty() {
+            return String::new()
+        }
+        chars[0] = chars[0].to_uppercase();
+        chars.join("")
+    }
+    fn to_camel_case(&self) -> String {
+        let mut words = self.as_ref().split("_").map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut result = vec![];
+        while let Some(first) = words.first() {
+            if first == "_" {
+                result.push("_".to_string());
+                words.remove(0);
+            } else {
+                break;
+            }
+        }
+        for (idx, word) in words.iter().enumerate() {
+            if idx == 0 {
+                result.push(word.to_lowercase())
+            } else {
+                result.push(word.to_lowercase().capitalize())
+            }
+        }
+        result.join("")
+    }
+    fn to_snake_case(&self) -> String {
+        let mut result = String::new();
+        let mut in_prefix = true;
+        let mut to_upper = false;
+        for ch in self.as_ref().chars() {
+            if ch == '_' {
+                if in_prefix {
+                    result += ch.to_string().as_str();
+                } else {
+                    to_upper = true;
+                }
+            } else {
+                in_prefix = false;
+            }
+            if to_upper {
+                result += ch.to_string().to_uppercase().as_str()
+            } else {
+                result += ch.to_string().as_str();
+            }
+        }
+        result
     }
 }
 
@@ -1100,7 +1310,7 @@ impl IntoOptionalType for TsUnionType {
             })
             .collect();
         if types.len() == 1 {
-            Some(typedb.resolve_type(types[0].as_ref(), false))
+            Some(typedb.resolve_type(types[0].as_ref()))
         } else {
             None
         }
@@ -1155,9 +1365,9 @@ impl TsTypeLitExtension for TsTypeLit {
         let TsFnParam::Ident(param) = param else {
             panic!("Invalid signature for ObjectMap: {sig:#?}")
         };
-        let key_type = typedb.resolve_type(param.type_ann.as_ref().unwrap().type_ann.as_ref(), false);
+        let key_type = typedb.resolve_type(param.type_ann.as_ref().unwrap().type_ann.as_ref());
         // panic!("{key_type:?}, {t:#?}");
-        let value_type = typedb.resolve_type(sig.type_ann.as_ref().unwrap().type_ann.as_ref(), false);
+        let value_type = typedb.resolve_type(sig.type_ann.as_ref().unwrap().type_ann.as_ref());
         Type::ObjectMap(Box::new(key_type), Box::new(value_type))
     }
 
@@ -1169,7 +1379,7 @@ impl TsTypeLitExtension for TsTypeLit {
                 return Type::None
             };
             let key = sig.key.as_ident().unwrap().sym.to_string();
-            let ty = typedb.resolve_type(&sig.type_ann.as_ref().unwrap().type_ann, false);
+            let ty = typedb.resolve_type(&sig.type_ann.as_ref().unwrap().type_ann);
             fields.push((key, ty))
         }
         Type::Object(fields)
@@ -1227,7 +1437,7 @@ impl TsTypeParamDeclExtension for TsTypeParamDecl {
             .map(|p| {
                 let name = p.name.sym.to_string();
                 let constraint = if let Some(c) = &p.constraint {
-                    api.resolve_type(&c, false)
+                    api.resolve_type(&c)
                 } else {
                     Type::None
                 };
